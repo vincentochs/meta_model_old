@@ -46,7 +46,10 @@ PATH_SINGLE_MODEL_1 = r'models/Model_1_App.pkl'
 PATH_SINGLE_MODEL_2 = r'models/Model_2_App.pkl'
 PATH_SINGLE_MODEL_3 = r'models/Model_3_App.pkl'
 PATH_SINGLE_MODEL_4 = r'models/Model_4_App.pkl'
-random_noise = 0.5
+
+# --- Calibration Parameters ---
+CLINICAL_BASELINE_PROB = 0.065  # The real-world average AL rate (6.5%)
+MODEL_RAW_AVERAGE_PROB = 0.015  # REPLACE THIS with your model's current average raw prediction
 
 # Risk thresholds
 RISK_THRESHOLDS = {
@@ -58,24 +61,35 @@ RISK_THRESHOLDS = {
     'cci_high': 3,
     'asa_high': 3,
     'crp_high': 10.0,
-    'hgb_low': 10.0
+    'hgb_low': 10.0,
+    'wbc_high': 11.0,
+    'wbc_low': 4.0,
+    'nrs_high': 3 # Nutritional Risk Screening
 }
 
-# Risk multipliers (how much to adjust probability)
-RISK_MULTIPLIERS = {
-    'age': 0.125,
-    'bmi': 0.125,
-    'albumin': 0.12,
-    'cci': 0.1,
-    'asa': 0.1,
-    'smoking': 0.1,
-    'neoadj_therapy': 0.08,
-    'prior_surgery': 0.09,
-    'emergency_surgery': 0.1,
-    'surgeon_exp': 0.08,
-    'approach_open': 0.07,
-    'crp': 0.15,
-    'hemoglobin': 0.1
+# Log-Odds Adjustments (Positive values strictly increase probability)
+LOG_ODDS_MULTIPLIERS = {
+    'age_high': 0.40,
+    'age_low': -0.20,
+    'bmi_extreme': 0.35,
+    'albumin_low': 0.50,
+    'cci_high': 0.25, # Per point over threshold
+    'asa_high': 0.30, # Per point over threshold
+    'smoking': 0.40,
+    'neoadj_therapy': 0.35,
+    'prior_surgery': 0.35,
+    'emergency_surgery': 0.45,
+    'approach_open': 0.40,
+    'surgeon_exp_teaching': 0.30,
+    'crp_high': 0.50,
+    'hemoglobin_low': 0.45,
+    'wbc_abnormal': 0.30,
+    'sex_male': 0.25, # Male pelvis is narrower, often higher AL risk
+    'indication_high_risk': 0.30, # Ischemia, Tumor, IBD
+    'operation_high_risk': 0.35, # e.g., Total colectomy, Hartmann
+    'anast_technique_hand': 0.15,
+    'anast_config_end_to_end': 0.10,
+    'nutr_status_high': 0.25 # Malnutrition risk
 }
 
 # Make a dictionary of categorical features
@@ -463,21 +477,17 @@ def initialize_app():
 
 ###############################################################################
 # Parser input function
-def parser_input(model_1 , model_2 , model_3 , model_4 , meta_model , dataframe_input):
+def parser_input(model_1, model_2, model_3, model_4, meta_model, dataframe_input):
     
-    # Handle mapping for categorical features, preserving -1 for "Not Available"
+    # Handle mapping for categorical features
     for col_name in dictionary_categorical_features.keys():
         if col_name in dataframe_input.columns:
             value = dataframe_input.at[0, col_name]
-            # If value is a string (e.g., 'Male'), map it. If it's -1, leave it.
             if isinstance(value, str) and value in dictionary_categorical_features[col_name]:
                 dataframe_input.at[0, col_name] = dictionary_categorical_features[col_name][value]
     
     # Create vector for meta model
     columns_input = model_1.feature_names_in_.tolist()
-    
-    # Fill -1 values with a strategy (e.g., mean/median) before predicting if models can't handle it
-    # For now, we assume the preprocessing pipeline inside the model handles it.
     df_for_prediction = dataframe_input.copy()
 
     X = pd.DataFrame({'Model_1' : model_1.predict_proba(df_for_prediction[columns_input])[: , 1],
@@ -490,116 +500,210 @@ def parser_input(model_1 , model_2 , model_3 , model_4 , meta_model , dataframe_
     
     # Make predictions
     y_pred_proba = predict_with_attention_model(meta_model, X)
-    y_pred = (y_pred_proba >= 0.5).astype(int)
     
-    st.markdown(
-        f'<p style="font-size:20px;">The AL likelihood with the given inputs is:</p>',
-        unsafe_allow_html=True
-    )
+    # --- PARAMETRIC RISK ADJUSTMENT & TRACKING ---
     
-    # PARAMETRIC RISK ADJUSTMENT RULES
-    print('Initial Likelihood:', y_pred_proba)
+    adjustments_log = [] # Tracks (Feature, Log-Odds Delta)
+    prob_history = []    # Tracks (Feature, Cumulative Probability)
 
-    # Added checks for -1 (Not Available) before applying any rule.
+    # 1. Calculate Calibration Shift
+    target_log_odds = np.log(CLINICAL_BASELINE_PROB / (1 - CLINICAL_BASELINE_PROB))
+    model_avg_log_odds = np.log(MODEL_RAW_AVERAGE_PROB / (1 - MODEL_RAW_AVERAGE_PROB))
+    calibration_shift = target_log_odds - model_avg_log_odds
+
+    y_pred_proba_clipped = np.clip(y_pred_proba, 1e-5, 1 - 1e-5)
+    current_log_odds = np.log(y_pred_proba_clipped / (1 - y_pred_proba_clipped))
     
-    # Age risk adjustment
+    # Apply Shift and record Baseline
+    current_log_odds += calibration_shift
+    adjustments_log.append(('Model Calibration Shift', calibration_shift))
+    
+    base_prob = 1 / (1 + np.exp(-current_log_odds))
+    prob_history.append(('Calibrated Baseline', base_prob))
+
+    # Helper function to track adjustments
+    def apply_adjustment(label, log_odds_adj):
+        nonlocal current_log_odds
+        current_log_odds += log_odds_adj
+        current_prob = 1 / (1 + np.exp(-current_log_odds))
+        adjustments_log.append((label, log_odds_adj))
+        prob_history.append((label, current_prob))
+
+    # 2. Evaluate All Features
+    
+    # Age
     age_val = dataframe_input['age'].values[0]
     if age_val != -1:
         if age_val > RISK_THRESHOLDS['age_high']:
-            y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['age'] * random_noise, 1.0)
-            print('Likelihood increased by age:', y_pred_proba)
-        elif y_pred_proba > 0.98 and age_val < RISK_THRESHOLDS['age_low']:
-            y_pred_proba = max(y_pred_proba - RISK_MULTIPLIERS['age'] * random_noise, 0.0)
-            print('Likelihood decreased by young age:', y_pred_proba)
-    
-    # BMI risk adjustment
+            apply_adjustment('Age > 70', LOG_ODDS_MULTIPLIERS['age_high'])
+        elif age_val < RISK_THRESHOLDS['age_low']:
+            apply_adjustment('Age < 30', LOG_ODDS_MULTIPLIERS['age_low'])
+
+    # BMI
     bmi_val = dataframe_input['bmi'].values[0]
     if bmi_val != -1 and (bmi_val < RISK_THRESHOLDS['bmi_low'] or bmi_val > RISK_THRESHOLDS['bmi_high']):
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['bmi'] * random_noise, 1.0)
-        print('Likelihood increased by BMI extremes:', y_pred_proba)
-    
-    # Albumin risk adjustment
+        apply_adjustment('BMI Extreme', LOG_ODDS_MULTIPLIERS['bmi_extreme'])
+
+    # Hemoglobin Level
+    hgb_val = dataframe_input['hgb_lvl'].values[0]
+    if hgb_val != -1 and hgb_val < RISK_THRESHOLDS['hgb_low']:
+        apply_adjustment('Low Hemoglobin', LOG_ODDS_MULTIPLIERS['hemoglobin_low'])
+
+    # WBC Count
+    wbc_val = dataframe_input['wbc_count'].values[0]
+    if wbc_val != -1 and (wbc_val < RISK_THRESHOLDS['wbc_low'] or wbc_val > RISK_THRESHOLDS['wbc_high']):
+        apply_adjustment('Abnormal WBC', LOG_ODDS_MULTIPLIERS['wbc_abnormal'])
+
+    # Albumin
     alb_val = dataframe_input['alb_lvl'].values[0]
     if alb_val != -1 and alb_val < RISK_THRESHOLDS['albumin_low']:
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['albumin'] * random_noise, 1.0)
-        print('Likelihood increased by low albumin:', y_pred_proba)
-    
-    # Charlson Comorbidity Index
+        apply_adjustment('Low Albumin', LOG_ODDS_MULTIPLIERS['albumin_low'])
+
+    # CRP Level
+    crp_val = dataframe_input['crp_lvl'].values[0]
+    if crp_val != -1 and crp_val >= RISK_THRESHOLDS['crp_high']:
+        apply_adjustment('High CRP', LOG_ODDS_MULTIPLIERS['crp_high'])
+
+    # Sex (Male = 2)
+    sex_val = dataframe_input['sex'].values[0]
+    if sex_val == 2:
+        apply_adjustment('Sex: Male', LOG_ODDS_MULTIPLIERS['sex_male'])
+
+    # Charlson Comorbidity Index (CCI)
     cci_val = int(dataframe_input['charlson_index'].values[0])
-    if cci_val != -1:
-        if cci_val > RISK_THRESHOLDS['cci_high']:
-            y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['cci'] * random_noise * cci_val, 1.0)
-            print('Likelihood increased by high CCI:', y_pred_proba)
-        elif y_pred_proba > 0.98 and cci_val <= RISK_THRESHOLDS['cci_high']:
-            y_pred_proba = max(y_pred_proba - RISK_MULTIPLIERS['cci'] * random_noise, 0.0)
-            print('Likelihood decreased by low CCI:', y_pred_proba)
-    
+    if cci_val != -1 and cci_val > RISK_THRESHOLDS['cci_high']:
+        sev = cci_val - RISK_THRESHOLDS['cci_high']
+        apply_adjustment(f'High CCI (+{sev})', LOG_ODDS_MULTIPLIERS['cci_high'] * sev)
+
     # ASA Score
     asa_val = int(dataframe_input['asa_score'].values[0])
     if asa_val != -1 and asa_val >= RISK_THRESHOLDS['asa_high']:
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['asa'] * random_noise * asa_val, 1.0)
-        print('Likelihood increased by high ASA:', y_pred_proba)
-    
-    # Smoking
+        sev = (asa_val - RISK_THRESHOLDS['asa_high']) + 1
+        apply_adjustment(f'High ASA (+{sev})', LOG_ODDS_MULTIPLIERS['asa_high'] * sev)
+
+    # Indication (Ischemia=4, Tumor=5, IBD=7)
+    ind_val = dataframe_input['indication'].values[0]
+    if ind_val in [4, 5, 7]:
+        apply_adjustment('High Risk Indication', LOG_ODDS_MULTIPLIERS['indication_high_risk'])
+
+    # Operation (Total colectomy=9, Hartmann=7)
+    op_val = dataframe_input['operation'].values[0]
+    if op_val in [7, 9]:
+        apply_adjustment('High Risk Operation', LOG_ODDS_MULTIPLIERS['operation_high_risk'])
+
+    # Approach (Open=3, Conversion to open=4)
+    approach_val = int(dataframe_input['approach'].values[0])
+    if approach_val != -1 and approach_val in [3, 4]: 
+        apply_adjustment('Open Approach', LOG_ODDS_MULTIPLIERS['approach_open'])
+
+    # Anastomotic Technique (Hand-sewn = 2)
+    tech_val = dataframe_input['anast_technique'].values[0]
+    if tech_val == 2:
+        apply_adjustment('Hand-sewn Anastomosis', LOG_ODDS_MULTIPLIERS['anast_technique_hand'])
+
+    # Anastomotic Configuration (End to End = 1)
+    config_val = dataframe_input['anast_config'].values[0]
+    if config_val == 1:
+        apply_adjustment('End-to-End Config', LOG_ODDS_MULTIPLIERS['anast_config_end_to_end'])
+
+    # Surgeon experience (Teaching operation = 2)
+    surgeon_exp_val = dataframe_input['surgeon_exp'].values[0]
+    if surgeon_exp_val != -1 and surgeon_exp_val >= 2:
+        apply_adjustment('Teaching Operation', LOG_ODDS_MULTIPLIERS['surgeon_exp_teaching'])
+
+    # Nutritional Risk Screening
+    nrs_val = dataframe_input['nutr_status_pts'].values[0]
+    if nrs_val != -1 and nrs_val >= RISK_THRESHOLDS['nrs_high']:
+        sev = (nrs_val - RISK_THRESHOLDS['nrs_high']) + 1
+        apply_adjustment(f'High NRS (+{sev})', LOG_ODDS_MULTIPLIERS['nutr_status_high'] * sev)
+
+    # Binary Condition Checkboxes
     smoking_val = dataframe_input['smoking'].values[0]
-    if smoking_val != -1:
-        if smoking_val >= 1: # Yes
-            y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['smoking'] * random_noise, 1.0)
-            print('Likelihood increased by smoking:', y_pred_proba)
-        elif y_pred_proba > 0.98 and smoking_val == 0: # No
-            y_pred_proba = max(y_pred_proba - RISK_MULTIPLIERS['smoking'] * random_noise, 0.0)
-            print('Likelihood decreased by non-smoking:', y_pred_proba)
-    
-    # Neoadjuvant therapy
+    if smoking_val != -1 and smoking_val >= 1: 
+        apply_adjustment('Smoking', LOG_ODDS_MULTIPLIERS['smoking'])
+
     neoadj_val = dataframe_input['neoadj_therapy'].values[0]
     if neoadj_val != -1 and neoadj_val >= 1:
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['neoadj_therapy'] * random_noise, 1.0)
-        print('Likelihood increased by neoadjuvant therapy:', y_pred_proba)
-    
-    # Prior abdominal surgery
+        apply_adjustment('Neoadjuvant Therapy', LOG_ODDS_MULTIPLIERS['neoadj_therapy'])
+
     prior_surg_val = dataframe_input['prior_surgery'].values[0]
-    if prior_surg_val != -1 and prior_surg_val >= 2:  # 'Yes' is mapped to 2
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['prior_surgery'] * random_noise, 1.0)
-        print('Likelihood increased by prior surgery:', y_pred_proba)
-    
-    # Emergency surgery
+    if prior_surg_val != -1 and prior_surg_val >= 2: 
+        apply_adjustment('Prior Surgery', LOG_ODDS_MULTIPLIERS['prior_surgery'])
+
     emerg_surg_val = dataframe_input['emerg_surg'].values[0]
     if emerg_surg_val != -1 and emerg_surg_val >= 1:
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['emergency_surgery'] * random_noise, 1.0)
-        print('Likelihood increased by emergency surgery:', y_pred_proba)
+        apply_adjustment('Emergency Surgery', LOG_ODDS_MULTIPLIERS['emergency_surgery'])
+
+    # 3. Final Output
+    final_pred_proba = 1 / (1 + np.exp(-current_log_odds))
     
-    # Surgical approach
-    approach_val = int(dataframe_input['approach'].values[0])
-    if approach_val != -1 and approach_val in [3, 4]:  # Open or Conversion to open
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['approach_open'] * random_noise, 1.0)
-        print('Likelihood increased by open approach:', y_pred_proba)
-    
-    # Surgeon experience
-    surgeon_exp_val = dataframe_input['surgeon_exp'].values[0]
-    if surgeon_exp_val != -1 and surgeon_exp_val >= 2:  # Teaching operation
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['surgeon_exp'] * random_noise, 1.0)
-        print('Likelihood increased by teaching operation:', y_pred_proba)
-    
-    # CRP level
-    crp_val = dataframe_input['crp_lvl'].values[0]
-    if crp_val != -1 and crp_val >= RISK_THRESHOLDS['crp_high']:
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['crp'] * random_noise, 1.0)
-        print('Likelihood increased by high CRP:', y_pred_proba)
-    
-    # Hemoglobin level
-    hgb_val = dataframe_input['hgb_lvl'].values[0]
-    if hgb_val != -1 and hgb_val < RISK_THRESHOLDS['hgb_low']:
-        y_pred_proba = min(y_pred_proba + RISK_MULTIPLIERS['hemoglobin'] * random_noise, 1.0)
-        print('Likelihood increased by low hemoglobin:', y_pred_proba)
-          
+    st.markdown("---")
     st.markdown(
-        f'<p style="font-size:20px;"> '
-        f'<span style="color:red; font-weight:bold;">{100 * y_pred_proba:.2f}% for Meta Model</span></p>',
+        f'<p style="font-size:24px; text-align:center;"> '
+        f'AL Likelihood: <span style="color:red; font-weight:bold;">{100 * final_pred_proba:.2f}%</span></p>',
         unsafe_allow_html=True
     )
     
-    return None
+    # 4. Render the Probability Trajectory Plot (For Customers)
+    # if len(prob_history) > 1:
+    #     st.subheader("Probability Evolution")
+    #     st.write("This chart shows how specific risk factors combined to reach the final probability estimate.")
+        
+    #     steps = [item[0] for item in prob_history]
+    #     probs = [item[1] * 100 for item in prob_history] # Convert to percentage
+        
+    #     fig2, ax2 = plt.subplots(figsize=(10, 5))
+        
+    #     # Plot line and markers
+    #     ax2.plot(steps, probs, marker='o', linestyle='-', color='#1f77b4', markersize=8, linewidth=2)
+        
+    #     # Formatting
+    #     ax2.set_ylabel('AL Probability (%)', fontsize=12)
+    #     ax2.set_ylim(0, max(probs) + min(100 - max(probs), 15)) # Give headroom, max 100%
+        
+    #     # Rotate x-axis labels to prevent overlap
+    #     plt.xticks(rotation=45, ha='right', fontsize=10)
+    #     ax2.grid(True, linestyle='--', alpha=0.5)
+        
+    #     # Annotate each point with the exact percentage
+    #     for i, (txt, p) in enumerate(zip(steps, probs)):
+    #         ax2.annotate(f"{p:.1f}%", (i, p), textcoords="offset points", xytext=(0,10), 
+    #                      ha='center', fontsize=9, fontweight='bold')
+            
+    #     ax2.spines['top'].set_visible(False)
+    #     ax2.spines['right'].set_visible(False)
+        
+    #     plt.tight_layout()
+    #     st.pyplot(fig2)
 
+    # 5. Render the Explainer Plot (Log-Odds / Technical Audit)
+    # if len(adjustments_log) > 0:
+    #     with st.expander("Technical View: Log-Odds Risk Adjustments"):
+    #         labels = [item[0] for item in adjustments_log]
+    #         values = [item[1] for item in adjustments_log]
+            
+    #         colors = ['gray' if 'Shift' in label else ('salmon' if val > 0 else 'lightgreen') for label, val in zip(labels, values)]
+            
+    #         fig, ax = plt.subplots(figsize=(8, max(4, len(labels) * 0.4)))
+    #         ax.barh(labels, values, color=colors, edgecolor='black', alpha=0.8)
+            
+    #         ax.axvline(0, color='black', linewidth=1)
+    #         ax.set_xlabel('Impact on Risk (Log-Odds)')
+    #         ax.invert_yaxis()
+    #         ax.grid(axis='x', linestyle='--', alpha=0.6)
+            
+    #         for i, v in enumerate(values):
+    #             ha = 'left' if v > 0 else 'right'
+    #             offset = 0.01 if v > 0 else -0.01
+    #             ax.text(v + offset, i, f"{v:+.2f}", va='center', ha=ha, fontsize=10)
+                
+    #         ax.spines['top'].set_visible(False)
+    #         ax.spines['right'].set_visible(False)
+            
+    #         plt.tight_layout()
+    #         st.pyplot(fig)
+    
+    return None
 
 ###############################################################################
 # Page configuration
