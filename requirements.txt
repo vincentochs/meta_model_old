@@ -1,0 +1,14 @@
+altair==5.5.0
+joblib==1.2.0
+matplotlib==3.7.2
+numpy==1.24.3
+pandas==1.5.3
+seaborn==0.13.2
+streamlit==1.36.0
+streamlit_option_menu==0.3.6
+streamlit_carousel==1.1.2
+tensorflow==2.17.0
+catboost==1.2.5
+lightgbm==4.3.0
+imbalanced-learn==0.12.2
+scikit-learn==1.4.2
